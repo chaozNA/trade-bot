@@ -1,0 +1,15 @@
+{
+    "1382389929182756874": {
+        "message_id": 1382389929182756874,
+        "symbol": "HOOD",
+        "status": "OPEN",
+        "entry_price": 1.29,
+        "stop_loss": 1.0,
+        "trade_type": "CALL",
+        "strike_price": 80.0,
+        "expiration_date": "N",
+        "creation_time": "2025-06-11T12:04:03.269735",
+        "last_update_time": "2025-06-11T12:04:03.269735",
+        "updates": []
+    }
+}

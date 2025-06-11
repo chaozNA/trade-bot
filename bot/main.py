@@ -1,10 +1,10 @@
 import logging
 from typing import Optional
 import discord
-from config import DISCORD_TOKEN, CHANNEL_IDS
-from discord_listener import DiscordListener
-from trade_manager import TradeManager
-from storage_manager import StorageManager
+from config.config import DISCORD_TOKEN, CHANNEL_IDS
+from .discord_listener import DiscordListener
+from .trade_manager import TradeManager
+from .storage_manager import StorageManager
 
 def setup_logging():
     logging.basicConfig(

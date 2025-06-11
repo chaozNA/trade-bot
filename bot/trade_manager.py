@@ -3,8 +3,8 @@ import re
 from typing import Optional
 
 from datetime import datetime, timedelta
-from trade import Trade, TradeStatus, TradeType
-from storage_manager import StorageManager
+from .trade import Trade, TradeStatus, TradeType
+from .storage_manager import StorageManager
 
 
 class TradeManager:

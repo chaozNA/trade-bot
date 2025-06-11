@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List
 
-from trade import Trade
+from .trade import Trade
 
 class StorageManager:
     """Handles saving and loading of trade data to a JSON file."""
