@@ -9,7 +9,7 @@ class DiscordListener:
         self.token = token
         self.channel_ids = channel_ids
         self.message_handler = message_handler
-        self.client = discord.Client(self_bot=True)
+        self.client = discord.Client()
         self._setup_events()
     
     def _setup_events(self):
@@ -20,9 +20,8 @@ class DiscordListener:
         @self.client.event
         async def on_message(message: discord.Message):
             if str(message.channel.id) in self.channel_ids:
-                user = self.channel_to_user[str(message.channel.id)]
-                logging.info(f"📩 Message from {user} (#{message.channel.name}): {message.content}")
-                await self.message_handler(message, user)
+                logging.info(f"📩 Message from #{message.channel.name}: {message.content}")
+                await self.message_handler(message)
         
         @self.client.event
         async def on_error(event, *args, **kwargs):
