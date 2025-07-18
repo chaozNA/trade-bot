@@ -8,21 +8,29 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 from commons.redis.redis_client import redis_client
-from commons.db.db_client import db_client
-from utils.logging_config import setup_logging, log_api_call
+from commons.mongodb.mongodb_client import MongoDBClient
+from utils.logger import get_logger
 
 # Set up logging
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 load_dotenv()
-MESSAGE_QUEUE = os.getenv('MESSAGE_QUEUE', 'discord_messages')
+MESSAGE_QUEUE = os.getenv('MESSAGE_QUEUE_NAME', 'message_queue')
 TRADE_ACTIONS_QUEUE = os.getenv('TRADE_ACTIONS_QUEUE', 'trade_actions')
 XAI_API_KEY = os.getenv('XAI_API_KEY')
+MESSAGES_COLLECTION = os.getenv("MESSAGES_COLLECTION", "raw_messages")
+ANALYZED_ACTIONS_COLLECTION = os.getenv("ANALYZED_ACTIONS_COLLECTION", "analyzed_actions")
+TRADES_COLLECTION = os.getenv("TRADES_COLLECTION", "trades")
+
+mongo_client = MongoDBClient()
+messages_coll = mongo_client.get_collection(MESSAGES_COLLECTION)
+analyses_coll = mongo_client.get_collection(ANALYZED_ACTIONS_COLLECTION)
+trades_coll = mongo_client.get_collection(TRADES_COLLECTION)
 
 def parse_expiration_date(date_str: str) -> str:
     """Parse various string representations of expiration dates into YYYY-MM-DD format."""
     if not isinstance(date_str, str):
-        return date.today().isoformat() # Default to today if invalid input
+        return date.today().isoformat()  # Default to today if invalid input
 
     date_str = date_str.lower()
     today = date.today()
@@ -49,22 +57,22 @@ def parse_expiration_date(date_str: str) -> str:
 class GrokAnalyzer:
     def __init__(self):
         # Get the logger for this specific module and set its level to DEBUG
-        self.logger = logging.getLogger(__name__)
+        self.logger = get_logger(__name__)
         self.logger.setLevel(logging.DEBUG)
         self.grok_client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1") if XAI_API_KEY else None
         if not self.grok_client:
             raise ValueError("XAI_API_KEY missing")
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    def analyze_message(self, content: str, history: List[Dict], reply_chain: str, active_trades: List[Dict]) -> Tuple[Dict, Dict, Optional[str]]:
+    def analyze_message(self, content: str, history: List[Dict], reply_chain: str, todays_trades: List[Dict]) -> Tuple[Dict, Dict, Optional[str]]:
         """Analyze a message using the Grok API and return the structured analysis."""
         if not self.grok_client:
-            return {'classification': 'other', 'reason': 'Grok client not initialized'}, {}, None
+            return {'action_type': 'other', 'reason': 'Grok client not initialized'}, {}, None
 
         self.logger.debug(f"Analyzing message content: {content}")
         try:
             # Prepare context for the prompt
-            active_trades_str = json.dumps(active_trades, indent=2, default=str)
+            todays_trades_str = json.dumps(todays_trades, indent=2, default=str)
             message_content = content
             reply_chain_str = reply_chain
             current_date_str = date.today().isoformat()
@@ -78,16 +86,16 @@ You are an expert trading analysis bot. Analyze the given Discord message and cl
 - 'irrelevant': No actionable trade info (e.g., general chat).
 
 **Rules**:
-- Classify as 'new_trade' ONLY if message has explicit details: ticker, CALL/PUT, strike, expiration. Else, 'irrelevant'.
+- Classify as 'new_trade' if message has explicit details: ticker, CALL/PUT, strike_price. Infer expiration_date if not specified: default to today ({current_date_str}) if today is Friday (0DTE), otherwise to next Friday ('this week').
 - For 'trade_update' or 'trade_close', MUST reference an active trade by symbol or details; include 'related_trade_id' (exact integer from active trades). If no match, classify as 'irrelevant'. Example: If message says "trim ORCL" and active trades have {{"trade_id": 456, "symbol": "ORCL"}}, use 456.
 - Infer 'sizing' for new trades: 'small' (lotto/small), 'medium' (high risk/medium), default 'large'.
 - Use YYYY-MM-DD for dates. '0DTE' = today ({current_date_str}); parse phrases like 'this week' to next Friday.
-- Output ONLY a valid JSON object with: 'classification', 'reason' (brief), 'confidence_score' (1-10).
+- Output ONLY a valid JSON object with: 'action_type', 'reason' (brief), 'confidence_score' (1-10).
 - Add for 'new_trade': 'ticker', 'option_type', 'strike_price', 'expiration_date', 'sizing'.
 - Add for 'trade_update'/'trade_close': 'related_trade_id', 'details' (e.g., 'trim 50%').
 
-**Active Trades** (JSON for reference):
-{active_trades_str}
+**Today's Trades** (JSON for reference, including all statuses for context):
+{todays_trades_str}
 
 **Reply Chain** (oldest to newest, for context):
 {reply_chain_str}
@@ -104,16 +112,16 @@ You are an expert trading analysis bot. Analyze the given Discord message and cl
                     {"role": "system", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.0,  # Set to 0.0 for more consistent outputs
+                temperature=0.2,  # Set to 0.0 for more consistent outputs
             )
             
             raw_response = response.choices[0].message.content
-            usage = response.usage.dict()
+            usage = response.usage.model_dump()
             self.logger.info(f"LLM raw response: {raw_response}")
             result = json.loads(raw_response)
             
-            if 'classification' not in result:
-                raise ValueError("Missing required 'classification' field in analysis result")
+            if 'action_type' not in result:
+                raise ValueError("Missing required 'action_type' field in analysis result")
             
             if 'expiration_date' in result and result['expiration_date']:
                 result['expiration_date'] = parse_expiration_date(result['expiration_date'])
@@ -124,7 +132,7 @@ You are an expert trading analysis bot. Analyze the given Discord message and cl
         except Exception as e:
             self.logger.error(f"Analysis error: {str(e)}")
             error_resp = {
-                'classification': 'other',
+                'action_type': 'other',
                 'reason': f'Error: {str(e)}'
             }
             # Return None for raw_response on error
@@ -133,78 +141,117 @@ You are an expert trading analysis bot. Analyze the given Discord message and cl
 class MessageProcessor:
     def __init__(self):
         self.redis_client = redis_client
-        self.db_client = db_client
         self.analyzer = GrokAnalyzer()
         self.max_reply_depth = 10
         self.history_limit = 10
         self.queue_name = MESSAGE_QUEUE
 
     def fetch_message_from_db(self, message_id: str) -> Optional[Dict]:
-        query = "SELECT * FROM messages WHERE message_id = ?"
-        return self.db_client.fetchone(query, (message_id,))
+        return messages_coll.find_one({"message_id": int(message_id)})
 
-    def fetch_reply_chain(self, message_id: str, chain: List[str] = None, depth: int = 0) -> str:
-        chain = chain or []
-        if depth > self.max_reply_depth:
-            return "Chain too deep."
-        message = self.fetch_message_from_db(message_id)
-        if not message:
+    def fetch_reply_chain(self, message_id: str) -> str:
+        """Fetch the full conversation thread for context."""
+        try:
+            message_id = int(message_id)
+            # Find the root by traversing upwards
+            current_id = message_id
+            parent_chain_ids = []
+            visited = set()
+            while current_id and current_id not in visited:
+                visited.add(current_id)
+                parent_chain_ids.append(current_id)
+                msg = messages_coll.find_one({"message_id": current_id})
+                if not msg:
+                    break
+                current_id = msg.get("parent_id")
+
+            if not parent_chain_ids:
+                return ""
+
+            root_id = parent_chain_ids[-1]  # Last ID in the chain is the root
+
+            # Now traverse the entire thread from the root downwards
+            chain = []
+            visited = set()
+
+            def add_message(msg_id, level=0):
+                if msg_id in visited:
+                    return
+                visited.add(msg_id)
+                msg = messages_coll.find_one({"message_id": msg_id})
+                if not msg:
+                    return
+                chain.append({
+                    "content": msg["content"],
+                    "timestamp": msg["timestamp"],
+                    "level": level
+                })
+                # Fetch and add replies, sorted by timestamp
+                replies = list(messages_coll.find({"parent_id": msg_id}).sort("timestamp", 1))
+                for reply in replies:
+                    add_message(reply["message_id"], level + 1)
+
+            # Start from root
+            add_message(root_id)
+
+            # Sort chronologically and format
+            chain.sort(key=lambda x: x.get("timestamp", ""))
+            formatted_chain = "\n".join([f"{'  ' * item['level']}{item['content']}" for item in chain])
+            return formatted_chain
+        except Exception as e:
+            logger.error(f"Error fetching reply chain: {e}")
             return ""
-        chain.append(message["content"])
-        if message["parent_id"]:
-            self.fetch_reply_chain(str(message["parent_id"]), chain, depth + 1)
-        return " > ".join(reversed(chain))
 
-    def load_active_trades(self) -> List[Dict]:
-        # Select only the columns needed for the LLM context to avoid schema errors
-        query = """
-            SELECT trade_id, symbol, option_type, strike, expiration, status, quantity
-            FROM trades 
-            WHERE status in ('open', 'pending_open') 
-            ORDER BY created_at DESC
-        """
-        return self.db_client.fetchall(query)
+    def load_todays_trades(self) -> List[Dict]:
+        today_start = datetime.combine(date.today(), datetime.min.time()).isoformat()
+        query = {"created_at": {"$gte": today_start}}
+        projection = {
+            "trade_id": 1, "symbol": 1, "option_type": 1, "strike": 1, 
+            "expiration": 1, "status": 1, "quantity": 1
+        }
+        return list(trades_coll.find(query, projection).sort("created_at", -1))
 
-    def load_recent_history(self, channel_id: int, timestamp: str, limit: int = None) -> List[Dict]:
+    def load_recent_history(self, channel_name: str, timestamp: str, limit: int = None) -> List[Dict]:
         limit = limit or self.history_limit
-        query = "SELECT content FROM messages WHERE channel_id = ? AND timestamp < ? ORDER BY timestamp DESC LIMIT ?"
-        rows = self.db_client.fetchall(query, (channel_id, timestamp, limit))
+        query = {"channel_name": channel_name, "timestamp": {"$lt": timestamp}}
+        projection = {"content": 1}
+        rows = list(messages_coll.find(query, projection).sort("timestamp", -1).limit(limit))
         return [{"role": "user", "content": row["content"]} for row in reversed(rows)]
 
     def store_analysis(self, message_id: str, analysis: Dict, usage: Dict, raw_response: Optional[str] = None):
-        """Stores the analysis result in the message_analyses table."""
+        """Stores the analysis result in the analyses collection."""
         try:
-            # Extract all key fields from the analysis
-            classification = analysis.get("classification", "other")
+            # Extract key fields
+            action_type = analysis.get("action_type", "other")
             related_trade_id = analysis.get("related_trade_id")
             reason = analysis.get("reason")
             confidence_score = analysis.get("confidence_score")
 
-            # Sanitize related_trade_id to ensure it's a valid foreign key or NULL
+            # Sanitize related_trade_id
             if not related_trade_id or related_trade_id == 0:
                 related_trade_id = None
 
-            # The full, raw analysis is stored for complete auditability
-            analysis_payload_json = json.dumps(analysis, default=str)
+            # Full payload
+            analysis_payload = analysis
+            analysis_payload["usage"] = usage
+            if raw_response:
+                analysis_payload["raw_response"] = raw_response
 
-            query = """
-                INSERT INTO message_analyses (
-                    message_id, classification, related_trade_id, reason, 
-                    confidence_score, analysis_payload
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(message_id) DO UPDATE SET
-                    classification = excluded.classification,
-                    related_trade_id = excluded.related_trade_id,
-                    reason = excluded.reason,
-                    confidence_score = excluded.confidence_score,
-                    analysis_payload = excluded.analysis_payload;
-            """
-            params = (
-                message_id, classification, related_trade_id, reason, 
-                confidence_score, analysis_payload_json
+            doc = {
+                "message_id": int(message_id),
+                "action_type": action_type,
+                "related_trade_id": related_trade_id,
+                "reason": reason,
+                "confidence_score": confidence_score,
+                "analysis_payload": analysis_payload,
+                "analysis_timestamp": datetime.now().isoformat()
+            }
+            analyses_coll.update_one(
+                {"message_id": int(message_id)},
+                {"$set": doc},
+                upsert=True
             )
-            self.db_client.execute(query, params)
-            logger.info(f"Stored analysis for message {message_id} with classification: {classification}")
+            logger.info(f"Stored analysis for message {message_id} with action_type: {action_type}")
 
         except Exception as e:
             logger.error(f"Failed to store analysis for message {message_id}: {e}", exc_info=True)
@@ -215,11 +262,13 @@ class MessageProcessor:
             'analysis': analysis
         }
         self.redis_client.push_to_queue(TRADE_ACTIONS_QUEUE, json.dumps(action_data))
-        logger.info(f"Queued action for message {message_id}: {analysis.get('recommended_trade_action')}")
+        logger.info(f"Queued action for message {message_id}: {analysis.get('action_type')}")
 
     def mark_message_processed(self, message_id: str):
-        query = "UPDATE messages SET processed = TRUE WHERE message_id = ?"
-        self.db_client.execute(query, (message_id,))
+        messages_coll.update_one(
+            {"message_id": int(message_id)},
+            {"$set": {"processed": True}}
+        )
         logger.debug(f"Marked message {message_id} as processed")
 
     def process_message(self, message: dict):
@@ -232,7 +281,7 @@ class MessageProcessor:
                 logger.warning(f"Message {message_id} not found in DB")
                 return
             
-            content = message.get('content', '').strip()
+            content = existing.get('content', '').strip()
             logger.info(f"Message content: {content}")
             
             if not content:
@@ -241,21 +290,20 @@ class MessageProcessor:
                 return
             
             # Check cache
-            query = "SELECT analysis_payload FROM message_analyses WHERE message_id = ?"
-            cached = self.db_client.fetchone(query, (message_id,))
+            cached = analyses_coll.find_one({"message_id": int(message_id)})
             if cached:
-                analysis = json.loads(cached['analysis_payload'])
+                analysis = cached.get("analysis_payload", {})
                 logger.info(f"Using cached analysis for {message_id}")
                 logger.debug(f"Cached analysis details: {json.dumps(analysis, indent=2)}")
-                logger.info(f"Cached classification: {analysis.get('classification')}")
+                logger.info(f"Cached action_type: {analysis.get('action_type')}")
             else:
                 reply_chain = self.fetch_reply_chain(message_id)
-                active_trades = self.load_active_trades()
-                history = self.load_recent_history(message["channel_id"], message["timestamp"])
-                analysis, usage, raw_response = self.analyzer.analyze_message(message['content'], history, reply_chain, active_trades)
+                todays_trades = self.load_todays_trades()
+                history = self.load_recent_history(existing.get("channel_name"), existing["timestamp"])
+                analysis, usage, raw_response = self.analyzer.analyze_message(content, history, reply_chain, todays_trades)
                 self.store_analysis(message_id, analysis, usage, raw_response)
             
-            if analysis["classification"] in ("new_trade", "trade_update", "trade_close"):
+            if analysis["action_type"] in ("new_trade", "trade_update", "trade_close"):
                 self.queue_trade_action(message_id, analysis)
             
             self.mark_message_processed(message_id)
@@ -265,10 +313,19 @@ class MessageProcessor:
 
     def run(self):
         logger.info("Processor started")
-        while True:
-            try:
-                message = self.redis_client.pop_from_queue(self.queue_name, timeout=1, is_json=True)
-                if message:
-                    self.process_message(message)
-            except Exception as e:
-                logger.error(f"Run error: {str(e)}")
+        try:
+            while True:
+                try:
+                    message_str = self.redis_client.pop_from_queue(self.queue_name, timeout=1)
+                    if message_str:
+                        data = {'message_id': message_str}
+                        self.process_message(data)
+                except Exception as e:
+                    logger.error(f"Run error: {str(e)}")
+                    time.sleep(1)  # Prevent tight loop on errors
+        except KeyboardInterrupt:
+            logger.info("Processor shutting down gracefully")
+
+if __name__ == "__main__":
+    processor = MessageProcessor()
+    processor.run()
