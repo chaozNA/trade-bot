@@ -1,3 +1,8 @@
 python-dotenv==1.0.0
 discord.py-self==2.0.1
 alpaca-py==0.40.1
+redis==6.2.0
+openai==1.97.0
+tenacity==9.1.2
+streamlit==1.47.0
+streamlit-autorefresh==1.0.1
